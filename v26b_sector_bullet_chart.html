@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>v26 • Sector Bullet Chart (Overlapped)</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+      :root {
+        --fg: #0f172a; /* slate-900 */
+        --muted: #64748b; /* slate-500 */
+        --grid: rgba(148, 163, 184, 0.25);
+        --bandA: rgba(2, 6, 23, 0.028);
+        --bandB: rgba(2, 6, 23, 0.09);
+        --past: 59, 130, 246; /* blue-500 */
+        --next: 2, 132, 199; /* sky-600 */
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: transparent;
+        font-family: Inter, system-ui, Segoe UI, Roboto, Helvetica, Arial,
+          sans-serif;
+      }
+      #wrap {
+        position: relative;
+        height: 100%;
+        width: 100%;
+        min-height: 260px;
+      }
+      #title {
+        position: absolute;
+        left: 12px;
+        top: 8px;
+        right: 12px;
+        color: var(--fg);
+        font-weight: 800;
+        font-size: clamp(16px, 3vw, 28px);
+        letter-spacing: 0.2px;
+      }
+      #legend {
+        position: absolute;
+        top: 50px;
+        left: 12px;
+        font-size: clamp(10px, 1.6vw, 14px);
+        color: var(--muted);
+        display: flex;
+        gap: 18px;
+        align-items: center;
+      }
+      .lg-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .lg-swatch {
+        width: 14px;
+        height: 10px;
+        border-radius: 3px;
+      }
+      #canvasWrap {
+        position: absolute;
+        inset: 0;
+        padding: clamp(8px, 1.8vw, 18px) clamp(10px, 2.2vw, 22px)
+          clamp(10px, 2.2vw, 22px) clamp(10px, 2.2vw, 22px);
+        padding-top: 72px;
+      }
+      canvas {
+        width: 100% !important;
+        height: 100% !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="wrap">
+      <div id="title">Projected Change by Sector</div>
+      <div id="legend">
+        <div class="lg-item">
+          <span
+            class="lg-swatch"
+            style="background: rgba(var(--past), 0.35)"
+          ></span
+          >past7d_pctCH
+        </div>
+        <div class="lg-item">
+          <span
+            class="lg-swatch"
+            style="background: rgba(var(--next), 0.95)"
+          ></span
+          >next7d_pctCH
+        </div>
+      </div>
+      <div id="canvasWrap"><canvas id="chart"></canvas></div>
+    </div>
+
+    <script>
+      // ---- Configurable state ----
+      const state = {
+        title: "Projected Change by Sector",
+        labelPast: "past7d_pctCH",
+        labelNext: "next7d_pctCH",
+        decimals: 2,
+        pastOpacity: 0.35,
+        nextOpacity: 0.95,
+        pastThickness: 20,
+        nextThickness: 10,
+        zeroLineColor: "rgba(15,23,42,.9)",
+        zeroLineWidth: 2,
+        maxBars: 40,
+        sort: "none", // "none" | "byNextDesc" | "byPastDesc"
+      };
+
+      // --- Plugins ---
+      // Vertical zero line at x=0
+      const ZeroLine = {
+        id: "zeroLine",
+        afterDatasetsDraw(chart, args, opts) {
+          const {
+            ctx,
+            scales: { x },
+            chartArea,
+          } = chart;
+          if (!x || !chartArea) return;
+          const zero = x.getPixelForValue(0);
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(zero, chartArea.top);
+          ctx.lineTo(zero, chartArea.bottom);
+          ctx.lineWidth = opts?.width ?? 2;
+          ctx.strokeStyle = opts?.color ?? "#000";
+          ctx.stroke();
+          ctx.restore();
+        },
+      };
+
+      // Row banding behind bars
+      const RowBanding = {
+        id: "rowBanding",
+        beforeDatasetsDraw(chart, args, opts) {
+          const {
+            ctx,
+            chartArea,
+            scales: { y },
+          } = chart;
+          if (!y || !chartArea) return;
+          const tickCount = y.ticks?.length ?? 0;
+          if (tickCount === 0) return;
+
+          ctx.save();
+          for (let i = 0; i < tickCount; i++) {
+            const center = y.getPixelForTick(i);
+            // estimate band boundaries using neighboring centers
+            const prev =
+              i === 0
+                ? y.getPixelForTick(i) -
+                  (y.getPixelForTick(i + 1) - y.getPixelForTick(i))
+                : y.getPixelForTick(i - 1);
+            const next =
+              i === tickCount - 1
+                ? y.getPixelForTick(i) +
+                  (y.getPixelForTick(i) - y.getPixelForTick(i - 1))
+                : y.getPixelForTick(i + 1);
+            const top = Math.min(center, (center + prev) / 2);
+            const bottom = Math.max(center, (center + next) / 2);
+
+            ctx.fillStyle =
+              i % 2 === 0
+                ? opts?.bandA ?? "rgba(2,6,23,.028)"
+                : opts?.bandB ?? "rgba(2,6,23,.09)";
+            ctx.fillRect(
+              chartArea.left,
+              top,
+              chartArea.right - chartArea.left,
+              bottom - top
+            );
+          }
+          ctx.restore();
+        },
+      };
+
+      // ---- Helpers ----
+      function buildFromRecords(records) {
+        const labels = [],
+          past = [],
+          next = [];
+        records.forEach((r) => {
+          labels.push(r.label);
+          past.push(+r.past || 0);
+          next.push(+r.next || 0);
+        });
+        return { labels, past, next };
+      }
+
+      function sampleRecords() {
+        return [
+          { label: "CRYPTO", past: 0.03, next: 0.168 },
+          { label: "Communication Services", past: 0.03, next: 0.122 },
+          { label: "Consumer Defensive", past: -0.001, next: 0.07 },
+          { label: "Financial Services", past: 0.01, next: 0.048 },
+          { label: "Technology", past: 0.014, next: 0.044 },
+          { label: "Energy", past: 0.009, next: 0.015 },
+          { label: "Consumer Cyclical", past: 0.028, next: -0.008 },
+          { label: "Real Estate", past: -0.002, next: -0.018 },
+          { label: "Industrials", past: -0.006, next: -0.025 },
+          { label: "Basic Materials", past: 0.03, next: -0.051 },
+          { label: "Healthcare", past: 0.043, next: -0.053 },
+          { label: "Utilities", past: -0.002, next: -0.053 },
+        ];
+      }
+
+      function sortRecords(recs) {
+        if (state.sort === "byNextDesc")
+          recs.sort((a, b) => (b.next ?? 0) - (a.next ?? 0));
+        else if (state.sort === "byPastDesc")
+          recs.sort((a, b) => (b.past ?? 0) - (a.past ?? 0));
+        return recs;
+      }
+
+      let chart = null;
+
+      function render(data) {
+        const ctx = document.getElementById("chart").getContext("2d");
+        if (chart) chart.destroy();
+
+        const labels = data.labels.slice(0, state.maxBars);
+        const past = data.past.slice(0, state.maxBars);
+        const next = data.next.slice(0, state.maxBars);
+
+        chart = new Chart(ctx, {
+          type: "bar",
+          plugins: [ZeroLine, RowBanding],
+          data: {
+            labels,
+            datasets: [
+              {
+                label: state.labelPast,
+                data: past,
+                backgroundColor: `rgba(${getComputedStyle(
+                  document.documentElement
+                ).getPropertyValue("--past")}, ${state.pastOpacity})`,
+                borderColor: "transparent",
+                grouped: false, // key: prevent X shift
+                barThickness: state.pastThickness,
+                borderRadius: 6,
+                order: 1,
+              },
+              {
+                label: state.labelNext,
+                data: next,
+                backgroundColor: `rgba(${getComputedStyle(
+                  document.documentElement
+                ).getPropertyValue("--next")}, ${state.nextOpacity})`,
+                borderColor: "transparent",
+                grouped: false, // key: same slot
+                barThickness: state.nextThickness,
+                borderRadius: 6,
+                order: 2,
+              },
+            ],
+          },
+          options: {
+            indexAxis: "y",
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 700, easing: "easeOutQuart" },
+            layout: { padding: { left: 6, right: 10, top: 0, bottom: 0 } },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                backgroundColor: "rgba(0,0,0,.85)",
+                cornerRadius: 6,
+                padding: 8,
+                callbacks: {
+                  title(ctx) {
+                    return ctx[0]?.label ?? "";
+                  },
+                  label(ctx) {
+                    return ` ${ctx.dataset.label}: ${(
+                      ctx.parsed.x * 100
+                    ).toFixed(state.decimals)}%`;
+                  },
+                },
+              },
+              zeroLine: {
+                color: state.zeroLineColor,
+                width: state.zeroLineWidth,
+              },
+              rowBanding: {
+                bandA: getComputedStyle(
+                  document.documentElement
+                ).getPropertyValue("--bandA"),
+                bandB: getComputedStyle(
+                  document.documentElement
+                ).getPropertyValue("--bandB"),
+              },
+            },
+            scales: {
+              x: {
+                position: "top", // x-axis labels on top
+                grid: {
+                  color: getComputedStyle(
+                    document.documentElement
+                  ).getPropertyValue("--grid"),
+                  drawBorder: false,
+                },
+                ticks: {
+                  color: getComputedStyle(
+                    document.documentElement
+                  ).getPropertyValue("--muted"),
+                  callback: (val) => `${Math.round(val * 100)}%`,
+                },
+              },
+              y: {
+                grid: { display: false },
+                ticks: {
+                  color: getComputedStyle(
+                    document.documentElement
+                  ).getPropertyValue("--fg"),
+                  font: { weight: "600" },
+                },
+              },
+            },
+          },
+        });
+      }
+
+      // Boot with data
+      function boot(records) {
+        const sorted = sortRecords(records);
+        render(buildFromRecords(sorted));
+      }
+
+      // postMessage API
+      window.addEventListener("message", (event) => {
+        const d = event.data || {};
+        try {
+          if (d.title) {
+            state.title = d.title;
+            document.getElementById("title").textContent = d.title;
+          }
+          if (d.sort) state.sort = d.sort;
+          if (Array.isArray(d.series)) {
+            const pastKey = d.pastKey || "past7d_pctCH";
+            const nextKey = d.nextKey || "next7d_pctCH";
+            const records = d.series.map((r) => ({
+              label: r.label ?? r.sector ?? r.name,
+              past: +(r[pastKey] ?? r.past ?? 0),
+              next: +(r[nextKey] ?? r.next ?? 0),
+            }));
+            boot(records);
+            return;
+          }
+          if (
+            Array.isArray(d.labels) &&
+            Array.isArray(d.past) &&
+            Array.isArray(d.next)
+          ) {
+            render({ labels: d.labels, past: d.past, next: d.next });
+          }
+        } catch (err) {
+          console.warn("postMessage error", err);
+        }
+      });
+
+      // Initial render
+      document.addEventListener("DOMContentLoaded", () => {
+        document.getElementById("title").textContent = state.title;
+        boot(sampleRecords());
+      });
+    </script>
+  </body>
+</html>
